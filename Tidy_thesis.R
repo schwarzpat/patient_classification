@@ -1,0 +1,1112 @@
+## ----setup, include=FALSE---------------------------------------------------------------------------------------------------------
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+
+
+## ---- echo=FALSE------------------------------------------------------------------------------------------------------------------
+#library(MASS)
+library(here)
+library(tidymodels)
+library(tidyverse)
+
+library(kableExtra)
+library(vip)
+library(readxl)
+
+
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+
+########################################################################
+# DATA LOAD AND CLEAN
+########################################################################
+
+
+final_data <- read_excel(here("data", "thesis_data_final.xlsx"))
+final_data <- final_data %>% drop_na() %>% select_if(~n_distinct(.) > 1)
+final_data <- final_data %>% mutate_if(is.character,as.factor)
+final_data_scaled <- final_data
+final_data_scaled$Age <- scale(final_data$Age)
+final_data_scaled$BMI <- scale(final_data$BMI)
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+########################################################################
+# MODEL SELECTION FOR STEPWISE TEST
+########################################################################
+
+#step.model <-glm(formula = Gender~ ., family = "binomial", 
+#   data = data_train)
+#summary(step.model)
+#step <- stepAIC(step.model, direction="both")
+#step
+
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+########################################################################
+# SPLIT DATA INTO TRAINING AND TEST SETS
+########################################################################
+
+#Set a random seed, in this way we can replicate the exact splits later on if needed
+set.seed(568)
+
+#Make the split rule
+splits <- initial_split(final_data, prop = 0.7, strata = Gender)
+
+#Use the split rule to retrieve the training data
+data_train <- training(splits)
+
+#Use the split rule to retrieve the test data
+data_test  <- testing(splits)
+
+#Make a version of the test data where the outcome is not included. 
+test_no_outcome <- data_test %>% dplyr::select(-Gender)
+test_y <- data_test %>% dplyr::select(Gender)
+test_x <- data_test %>% dplyr::select(-Gender)
+train_y <- data_train %>% dplyr::select(Gender)
+train_x <- data_train %>% dplyr::select(-Gender)
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+save(data_test, file = "data_test.RData")
+save(test_x, file = "test_x.RData")
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+########################################################################
+# CREATE CROSS-VALIDATION FOLDS FOR MODEL EVALUATION/COMPARISON
+########################################################################
+#Prepare for 10-fold cross-validation, observations selected into folds with random 
+#sampling stratified on outcome
+set.seed(877)
+folds <- vfold_cv(data_train, v =10, strata = Gender)
+#folds <- loo_cv(data_train)
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+save(folds, file = "cv_folds.RData")
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+########################################################################
+# EVALUATION METRICS
+########################################################################
+#Which metrics should be computed?
+my_metrics <- metric_set(roc_auc, recall, specificity, sensitivity, accuracy, bal_accuracy)
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+########################################################################
+# CREATE RECIPE FOR PREPROCESSING DATA
+########################################################################
+#Create recipe for preprocessing data: undersampling majority class, categorical variables into dummy variables etc
+train_rec <- 
+  recipe(Gender ~ ., data = data_train) %>%   
+  step_normalize(all_numeric()) %>% 
+  step_dummy(all_nominal(), -all_outcomes()) 
+
+stepwise_rec <- 
+  recipe(Gender ~ CM_IHD + Lung_Disease + Symptom_Fever + 
+    Symptom_Nausea_Vomiting, data = data_train) %>%   
+  step_normalize(all_numeric()) %>% 
+  step_dummy(all_nominal(), -all_outcomes()) 
+
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+########################################
+# MODEL 1: Logistic regression
+########################################
+
+#Model specification
+lr_mod <-
+  logistic_reg() %>%
+  set_engine("glm")
+
+#Work flow: Which model to use and how data should be preprocessed
+lr_wflow <-
+  workflow() %>%
+  add_model(lr_mod) %>%
+  add_recipe(train_rec)
+
+#Use the workflow and folds object to fit model on cross-validation resamples
+lr_fit_rs <- 
+  lr_wflow %>% 
+  fit_resamples(folds, metrics = my_metrics, control = control_resamples(save_pred = TRUE))
+
+#Get mean out-of-sample performance measures
+lr_metrics <- collect_metrics(lr_fit_rs)
+lr_metrics
+
+#Store part of the metrics object for later comparison with other models
+lr_metrics_sub <- lr_metrics[ , c(1,3,5)]
+lr_metrics_sub <- lr_metrics_sub %>% 
+  pivot_longer(!.metric, names_to = "measure", values_to = ".estimate")
+
+#Fit the above logistic regression model on the full training data
+lr_fit_train <- 
+  lr_wflow %>%
+  fit(data = data_train)
+
+#Look at the model summary
+summary(lr_fit_train$fit$fit$fit)
+
+#Get the predicted class probabilities computed for the full training data
+lr_pred_prob_train <- predict(lr_fit_train , type = "prob", new_data =  data_train)
+#Get the receiver operator curve (ROC) computed for the full training data
+lr_train_roc <-roc_curve(tibble(Gender = data_train$Gender, lr_pred_prob_train), truth = Gender, .estimate = .pred_Female) %>% 
+  mutate(model = "Log_reg")
+
+#Get predicted class (outcome) and class probabilities for the test data
+#When you have test data with outcome
+lr_pred_class_test <- predict(lr_fit_train , type = "class", new_data =  data_test)
+lr_pred_prob_test <- predict(lr_fit_train , type = "prob", new_data =  data_test)
+
+
+#When you have test data without outcome
+lr_pred_class_test_x <- predict(lr_fit_train , type = "class", new_data =  test_no_outcome)
+lr_pred_prob_test_x<- predict(lr_fit_train , type = "prob", new_data =  test_no_outcome)
+
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+################################################
+# MODEL 2: Stepwise logistic regression 
+################################################
+
+#Model specification
+step_mod <-
+  logistic_reg() %>%
+  set_engine("glm")
+
+#Work flow: Which model to use and how data should be preprocessed
+step_wflow <-
+  workflow() %>%
+  add_model(step_mod) %>%
+  add_recipe(stepwise_rec)
+
+#Use the workflow and folds object to fit model on cross-validation resamples
+step_fit_rs <- 
+  step_wflow %>% 
+  fit_resamples(folds, metrics = my_metrics, control = control_resamples(save_pred = TRUE))
+
+#Get mean out-of-sample performance measures
+step_metrics <- collect_metrics(step_fit_rs)
+step_metrics
+
+#Store part of the metrics object for later comparison with other models
+step_metrics_sub <- step_metrics[ , c(1,3,5)]
+step_metrics_sub <- step_metrics_sub %>% 
+  pivot_longer(!.metric, names_to = "measure", values_to = ".estimate")
+
+#Fit the above logistic regression model on the full training data
+step_fit_train <- 
+  step_wflow %>%
+  fit(data = data_train)
+
+#Look at the model summary
+summary(step_fit_train$fit$fit$fit)
+
+#Get the predicted class probabilities computed for the full training data
+step_pred_prob_train <- predict(step_fit_train , type = "prob", new_data =  data_train)
+#Get the receiver operator curve (ROC) computed for the full training data
+stepwise_train_roc <-roc_curve(tibble(Gender = data_train$Gender, step_pred_prob_train), truth = Gender, .estimate = .pred_Female) %>% 
+  mutate(model = "Step_reg")
+
+#Get predicted class (outcome) and class probabilities for the test data
+#When you have test data with outcome
+step_pred_class_test <- predict(step_fit_train , type = "class", new_data =  data_test)
+step_pred_prob_test <- predict(step_fit_train , type = "prob", new_data =  data_test)
+
+
+#When you have test data without outcome
+step_pred_class_test_x <- predict(step_fit_train , type = "class", new_data =  test_no_outcome)
+step_pred_prob_test_x<- predict(step_fit_train , type = "prob", new_data =  test_no_outcome)
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+################################################
+# MODEL 3: Penalized logistic regression (Ridge)
+################################################
+
+#Model specification
+ridge_mod <- 
+  logistic_reg(mixture = 0, penalty = tune()) %>% 
+  set_engine("glmnet") %>%
+  set_mode("classification") 
+lambda_grid <- grid_regular(penalty(), levels = 100)
+#Set up workflow
+ridge_wflow <-
+  workflow() %>%
+  add_model(ridge_mod) %>%
+  add_recipe(train_rec)
+
+#Get a parameter object for our data and model specification. Contains information about possible values, ranges, types etc.
+ridge_param <-
+  ridge_wflow %>%
+  parameters() %>% 
+  finalize(data_train)
+
+#Look at the range for the penalty parameter
+ridge_param %>% pull_dials_object("penalty")
+
+
+
+#Tune the model: Set up a grid of penalty values to be evalutated and select the optimal penalty value (in terms of AUROC)
+set.seed(99)
+ ridge_tune <-
+   ridge_wflow %>%
+   tune_grid(
+     folds,
+      grid = ridge_param %>% grid_regular(levels = c(penalty = 200)),
+     metrics = my_metrics
+   )
+
+
+#View plot of penalty values vs. AUROC
+autoplot(ridge_tune) + theme(legend.position = "top")
+
+#View the penalty values with largest AUROC
+show_best(ridge_tune) %>% select(-.estimator)
+
+#Store the best penalty value
+ridge_best_param <- select_best(ridge_tune, "roc_auc")
+
+#Set up the final workflow using the best penalty value
+final_ridge_wflow <- 
+  ridge_wflow %>% 
+  finalize_workflow(ridge_best_param)
+
+#View the workflow specifiations
+final_ridge_wflow
+
+#Fit the final model on the cross-validation folds set up for model evaluation/comparison
+ridge_fit_rs <- 
+  final_ridge_wflow %>% 
+  fit_resamples(folds, metrics = my_metrics, control = control_resamples(save_pred = TRUE))
+
+#Get mean out-of-sample performance measures
+ridge_metrics <- collect_metrics(ridge_fit_rs)
+ridge_metrics
+
+#Store part of the metrics object for later comparison with other models
+ridge_metrics_sub <- ridge_metrics[, c(1,3,5)]
+ridge_metrics_sub <- ridge_metrics_sub %>% 
+  pivot_longer(!.metric, names_to = "measure", values_to = "estimate")
+
+
+#Fit the final model on the full training data
+ridge_fit_train <- 
+  final_ridge_wflow %>%
+  fit(data = data_train)
+
+
+#Look at variable importance
+ridge_fit_train%>% 
+  pull_workflow_fit() %>% 
+  vip(lambda = ridge_best_param$penalty, num_features = 200)
+
+
+#Get the model coefficients
+ridge_coeff <- data.frame(ridge_fit_train %>%
+                            pull_workflow_fit() %>%
+                            tidy())
+
+#Number of non-zero coefficients
+sum(ridge_coeff$estimate != 0)
+
+#Number of zero coefficients
+sum(ridge_coeff$estimate == 0)
+
+
+#Get the predicted class probabilities computed for the full training data
+ridge_pred_prob_train <- predict(ridge_fit_train , type = "prob", new_data =  data_train)
+#Get the receiver operator curve (ROC) computed for the full training data
+ridge_train_roc <- roc_curve(tibble(Gender = data_train$Gender, ridge_pred_prob_train), truth = Gender, estimate =.pred_Female)  %>% 
+  mutate(model = "Ridge_reg")
+
+#Get predicted class (outcome) and class probabilities for the test data
+#When you have test data with outcome
+ridge_pred_class_test <- predict(ridge_fit_train , type = "class", new_data =  data_test)
+ridge_pred_prob_test <- predict(ridge_fit_train , type = "prob", new_data =  data_test)
+#When you have test data without outcome
+ridge_pred_class_test_no_outcome <- predict(ridge_fit_train , type = "class", new_data =  test_no_outcome)
+ridge_pred_prob_test_no_outcome <- predict(ridge_fit_train , type = "prob", new_data =  test_no_outcome)
+
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+################################################
+# MODEL 4: Penalized logistic regression (LASSO)
+################################################
+
+#Model specification
+lasso_mod <- 
+  logistic_reg(mixture = 1, penalty = tune()) %>% #Specify that we want to tune the penalty parameter
+  set_engine("glmnet") %>%
+  set_mode("classification") 
+lambda_grid <- grid_regular(penalty(), levels = 100)
+#Set up workflow
+lasso_wflow <-
+  workflow() %>%
+  add_model(lasso_mod) %>%
+  add_recipe(train_rec)
+
+#Get a parameter object for our data and model specification. Contains information about possible values, ranges, types etc.
+lasso_param <-
+  lasso_wflow %>%
+  parameters() %>% 
+  finalize(data_train)
+
+#Look at the range for the penalty parameter
+lasso_param%>% pull_dials_object("penalty")
+
+
+#Tune the model: Set up a grid of penalty values to be evalutated and select the optimal penalty value (in terms of AUROC)
+set.seed(99)
+ lasso_tune <-
+   lasso_wflow %>%
+   tune_grid(
+     folds,
+      grid = lasso_param %>% grid_regular(levels = c(penalty = 200)),
+     metrics = my_metrics
+   )
+
+
+#View plot of penalty values vs. AUROC
+autoplot(lasso_tune) + theme(legend.position = "top")
+
+#View the penalty values with largest AUROC
+show_best(lasso_tune) %>% select(-.estimator)
+
+#Store the best penalty value
+lasso_best_param <- select_best(lasso_tune, "roc_auc")
+
+#Set up the final workflow using the best penalty value
+final_lasso_wflow <- 
+  lasso_wflow %>% 
+  finalize_workflow(lasso_best_param)
+
+#View the workflow specifiations
+final_lasso_wflow
+
+#Fit the final model on the cross-validation folds set up for model evaluation/comparison
+lasso_fit_rs <- 
+  final_lasso_wflow %>% 
+  fit_resamples(folds, metrics = my_metrics, control = control_resamples(save_pred = TRUE))
+
+#Get mean out-of-sample performance measures
+lasso_metrics <- collect_metrics(lasso_fit_rs)
+lasso_metrics
+
+#Store part of the metrics object for later comparison with other models
+lasso_metrics_sub <- lasso_metrics[, c(1,3,5)]
+lasso_metrics_sub <- lasso_metrics_sub %>% 
+  pivot_longer(!.metric, names_to = "measure", values_to = "estimate")
+
+
+#Fit the final model on the full training data
+lasso_fit_train <- 
+  final_lasso_wflow %>%
+  fit(data = data_train)
+
+
+#Look at variable importance
+lasso_fit_train%>% 
+  pull_workflow_fit() %>% 
+  vip(lambda = lasso_best_param$penalty, num_features = 200)
+
+
+#Get the model coefficients
+lasso_coeff <- data.frame(lasso_fit_train %>%
+                            pull_workflow_fit() %>%
+                            tidy())
+
+#Number of non-zero coefficients
+sum(lasso_coeff$estimate != 0)
+
+#Number of zero coefficients
+sum(lasso_coeff$estimate == 0)
+
+
+#Get the predicted class probabilities computed for the full training data
+lasso_pred_prob_train <- predict(lasso_fit_train , type = "prob", new_data =  data_train)
+#Get the receiver operator curve (ROC) computed for the full training data
+lasso_train_roc <- roc_curve(tibble(Gender = data_train$Gender, lasso_pred_prob_train), truth = Gender, estimate =.pred_Female)  %>% 
+  mutate(model = "Lasso_reg")
+
+#Get predicted class (outcome) and class probabilities for the test data
+#When you have test data with outcome
+lasso_pred_class_test <- predict(lasso_fit_train , type = "class", new_data =  data_test)
+lasso_pred_prob_test <- predict(lasso_fit_train , type = "prob", new_data =  data_test)
+#When you have test data without outcome
+lasso_pred_class_test_no_outcome <- predict(lasso_fit_train , type = "class", new_data =  test_no_outcome)
+lasso_pred_prob_test_no_outcome <- predict(lasso_fit_train , type = "prob", new_data =  test_no_outcome)
+
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+################################################
+# MODEL 5: Logistic elastic net regression (ELNET)
+################################################
+
+#Model specification
+elnet_mod <- 
+  logistic_reg(mixture = tune(), penalty = tune()) %>% #Specify that we want to tune the penalty parameter and the mixture
+  set_engine("glmnet") %>%
+  set_mode("classification") 
+lambda_grid <- grid_regular(penalty(), levels = 50)
+#Set up workflow
+elnet_wflow <-
+  workflow() %>%
+  add_model(elnet_mod) %>%
+  add_recipe(train_rec)
+
+#Get a parameter object for our data and model specification. Contains information about possible values, ranges, types etc.
+elnet_param <-
+  elnet_wflow %>%
+  parameters() %>% 
+  finalize(data_train)
+
+#Look at the range for the penalty parameter
+elnet_param%>% pull_dials_object("penalty")
+
+
+#Tune the model: Set up a grid of penalty values to be evalutated and select the optimal penalty value (in terms of AUROC)
+set.seed(99)
+ elnet_tune <-
+   elnet_wflow %>%
+   tune_grid(
+     folds,
+      grid = elnet_param %>% grid_regular(levels = c(penalty = 100, mixture = 10)),
+     metrics = my_metrics
+   )
+
+
+#View plot of penalty values vs. AUROC
+autoplot(elnet_tune) + theme(legend.position = "top")
+
+#View the penalty values with largest AUROC
+show_best(elnet_tune) %>% select(-.estimator)
+
+#Store the best penalty value
+elnet_best_param <- select_best(elnet_tune, "roc_auc")
+
+#Set up the final workflow using the best penalty value
+final_elnet_wflow <- 
+  elnet_wflow %>% 
+  finalize_workflow(elnet_best_param)
+
+#View the workflow specifiations
+final_elnet_wflow
+
+#Fit the final model on the cross-validation folds set up for model evaluation/comparison
+elnet_fit_rs <- 
+  final_elnet_wflow %>% 
+  fit_resamples(folds, metrics = my_metrics, control = control_resamples(save_pred = TRUE))
+
+#Get mean out-of-sample performance measures
+elnet_metrics <- collect_metrics(elnet_fit_rs)
+elnet_metrics
+
+#Store part of the metrics object for later comparison with other models
+elnet_metrics_sub <- elnet_metrics[, c(1,3,5)]
+elnet_metrics_sub <- elnet_metrics_sub %>% 
+  pivot_longer(!.metric, names_to = "measure", values_to = "estimate")
+
+
+#Fit the final model on the full training data
+elnet_fit_train <- 
+  final_elnet_wflow %>%
+  fit(data = data_train)
+
+
+#Look at variable importance
+elnet_fit_train%>% 
+  pull_workflow_fit() %>% 
+  vip(lambda = elnet_best_param$penalty, num_features = 200)
+
+
+#Get the model coefficients
+elnet_coeff <- data.frame(elnet_fit_train %>%
+                            pull_workflow_fit() %>%
+                            tidy())
+
+#Number of non-zero coefficients
+sum(elnet_coeff$estimate != 0)
+
+#Number of zero coefficients
+sum(elnet_coeff$estimate == 0)
+
+
+#Get the predicted class probabilities computed for the full training data
+elnet_pred_prob_train <- predict(elnet_fit_train , type = "prob", new_data =  data_train)
+#Get the receiver operator curve (ROC) computed for the full training data
+elnet_train_roc <- roc_curve(tibble(Gender = data_train$Gender, elnet_pred_prob_train), truth = Gender, estimate =.pred_Female)  %>% 
+  mutate(model = "Elnet")
+
+#Get predicted class (outcome) and class probabilities for the test data
+#When you have test data with outcome
+elnet_pred_class_test <- predict(elnet_fit_train , type = "class", new_data =  data_test)
+elnet_pred_prob_test <- predict(elnet_fit_train , type = "prob", new_data =  data_test)
+#When you have test data without outcome
+elnet_pred_class_test_no_outcome <- predict(elnet_fit_train , type = "class", new_data =  test_no_outcome)
+elnet_pred_prob_test_no_outcome <- predict(elnet_fit_train , type = "prob", new_data =  test_no_outcome)
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+library(inspectdf)
+library(skimr)
+library(table1)
+library(MuMIn)
+library(plotmo)
+library(separationplot)
+library(ggfortify)
+library(car)
+library(cvms)
+library(broom)
+library(yardstick)
+library(glmnet)
+library(glmtoolbox)
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+######################################################
+# SUMMARIZE RESULTS BASED ON TRAINING DATA EVALUATIONS
+######################################################
+
+#Combine the results from different models in one tibble
+metrics_table_data_train <- bind_cols(lr_metrics_sub[c(11:12, 1:10, 13:14), 1:3], step_metrics_sub [c(11:12, 1:10, 13:14), 1:3],ridge_metrics_sub[c(11:12, 1:10, 13:14), 3], lasso_metrics_sub[c(11:12, 1:10, 13:14), 3]  , elnet_metrics_sub[c(11:12, 1:10, 13:14), 3])
+colnames(metrics_table_data_train) <- c("Metric", "Measure", "Log_reg", "Step_reg", "Ridge_reg", "Lasso_reg", "Elnet")
+
+#Convert the tibble to a data.frame
+results_table_train <- data.frame(metrics_table_data_train)
+
+#Produce a table with results based on training data
+results_table_train %>%
+  kbl(caption = "Table 3. Model performance based on 10-fold CV on training data (n = 94)",  digits = 3) %>%
+  kable_classic(full_width = F, html_font = "Cambria") %>%
+  collapse_rows(columns = 1, valign = "top")
+
+
+#Plot ROC:s on final models fit on full training data
+bind_rows(lr_train_roc, stepwise_train_roc, ridge_train_roc,lasso_train_roc, elnet_train_roc) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = model)) + 
+  geom_path(lwd = 1.5, alpha = 0.8) +
+  geom_abline(lty = 3) + 
+  coord_equal() + 
+  scale_color_viridis_d(option = "plasma", end = .6)+
+  ggtitle("ROC Based on Training Data")
+
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+######################################################
+# SUMMARIZE RESULTS BASED ON TEST DATA EVALUATION
+######################################################
+
+#Prepare results for producing a table
+lr_results_test <- tibble(Gender = data_test$Gender, lr_pred_prob_test, lr_pred_class_test)
+step_results_test <- tibble(Gender = data_test$Gender, step_pred_prob_test, step_pred_class_test)
+ridge_results_test <- tibble(Gender = data_test$Gender, ridge_pred_prob_test, ridge_pred_class_test)
+lasso_results_test <- tibble(Gender = data_test$Gender, lasso_pred_prob_test, lasso_pred_class_test)
+elnet_results_test <- tibble(Gender = data_test$Gender, elnet_pred_prob_test, elnet_pred_class_test)
+
+lr_metrics_sub_test <- bind_rows(roc_auc(lr_results_test, Gender, .pred_Female)[, c(1,3)],
+                                 accuracy(lr_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                 bal_accuracy(lr_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                 f_meas(lr_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                 precision(lr_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                 recall(lr_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                 specificity(lr_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                  sensitivity(lr_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)])
+
+
+step_metrics_sub_test <- bind_rows(roc_auc(step_results_test, Gender, .pred_Female)[, c(1,3)],
+                                    accuracy(step_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                    bal_accuracy(step_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                    f_meas(step_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                    precision(step_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                    recall(step_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                    specificity(step_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                    sensitivity(step_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)])
+
+
+ridge_metrics_sub_test <- bind_rows(roc_auc(ridge_results_test, Gender, .pred_Female)[, c(1,3)],
+                                  accuracy(ridge_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                  bal_accuracy(ridge_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                  f_meas(ridge_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                  precision(ridge_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                  recall(ridge_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                  specificity(ridge_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                  sensitivity(ridge_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)])
+
+
+lasso_metrics_sub_test <- bind_rows(roc_auc(lasso_results_test, Gender, .pred_Female)[, c(1,3)],
+                                 accuracy(lasso_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                 bal_accuracy(lasso_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                 f_meas(lasso_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                 precision(lasso_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                 recall(lasso_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                 specificity(lasso_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                 sensitivity(lasso_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)])
+
+elnet_metrics_sub_test <- bind_rows(roc_auc(elnet_results_test, Gender, .pred_Female)[, c(1,3)],
+                                  accuracy(elnet_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                  bal_accuracy(elnet_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                  f_meas(elnet_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                  precision(elnet_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                  recall(elnet_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                  specificity(elnet_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)],
+                                  sensitivity(elnet_results_test, truth = Gender, estimate = .pred_class)[, c(1,3)])
+
+
+#Combine the results from different models in one tibble
+metrics_table_data_test <- bind_cols(lr_metrics_sub_test[, 1:2], step_metrics_sub_test[, 2], ridge_metrics_sub_test[, 2], lasso_metrics_sub_test[, 2], elnet_metrics_sub_test[, 2])
+colnames(metrics_table_data_test) <- c("Metric", "Logistic", "Stepwise", "Ridge", "Lasso", "Elnet")
+
+
+#Convert the tibble to a data.frame
+results_table_test <- data.frame(metrics_table_data_test)
+
+#Produce a table with results based on test data
+results_table_test %>%
+  kbl(caption = "Table 4. Model performance evaluated on test data (n = 40)",  digits = 3) %>%
+  kable_classic(full_width = F, html_font = "Cambria") %>%
+  collapse_rows(columns = 1, valign = "top")
+
+
+
+
+#Plot ROC:s using final models fit on full training data to predict on test data
+lr_test_roc <- roc_curve(tibble(Gender = data_test$Gender, lr_pred_prob_test), truth = Gender, estimate =.pred_Female)  %>% 
+  mutate(model = "Log_reg")
+stepwise_test_roc <- roc_curve(tibble(Gender = data_test$Gender, step_pred_prob_test), truth = Gender, estimate =.pred_Female)  %>% 
+  mutate(model = "Stepwise_reg")
+ridge_test_roc <- roc_curve(tibble(Gender = data_test$Gender, ridge_pred_prob_test), truth = Gender, estimate =.pred_Female)  %>% 
+  mutate(model = "Ridge_reg")
+lasso_test_roc <- roc_curve(tibble(Gender = data_test$Gender, lasso_pred_prob_test), truth = Gender, estimate =.pred_Female)  %>% 
+  mutate(model = "Lasso_reg")
+elnet_test_roc <- roc_curve(tibble(Gender = data_test$Gender, elnet_pred_prob_test), truth = Gender, estimate =.pred_Female)  %>% 
+  mutate(model = "Elnet_reg")
+
+
+bind_rows(lr_test_roc, stepwise_test_roc, ridge_test_roc,lasso_test_roc, elnet_test_roc) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = model)) + 
+  geom_path(lwd = 1.5, alpha = 0.8, position=position_dodge(width=0.05)) +
+  geom_abline(lty = 3) + 
+  coord_equal() + 
+  scale_color_viridis_d(option = "turbo", end = .6)+
+  ggtitle("ROC Based on Test Data")
+
+
+
+
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+lasso_tune  %>%
+  collect_metrics()
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+######################################################
+# LASSO PLOTS
+######################################################
+lasso_tune %>%
+  collect_metrics() %>%
+  ggplot(aes(penalty, mean, color = .metric)) +
+  #geom_errorbar(aes(
+  #  ymin = mean - std_err,
+   # ymax = mean + std_err
+  #),
+  #alpha = 0.5
+  #) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")
+
+best_auc <- lasso_tune %>%
+  select_best("roc_auc", maximize = T)
+lasso_fit_train %>%
+  fit(data_train) %>%
+  pull_workflow_fit() %>%
+  vi(lambda = best_auc$penalty) %>%
+  mutate(
+    Importance = abs(Importance),
+    Variable = fct_reorder(Variable, Importance)
+  ) %>%
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL) +
+  ggtitle("Lasso Model - Explanatory Variable Importance")
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+######################################################
+# RIDGE PLOTS
+######################################################
+ridge_tune %>%
+  collect_metrics() %>%
+  ggplot(aes(penalty, mean, color = .metric)) +
+  #geom_errorbar(aes(
+  #  ymin = mean - std_err,
+   # ymax = mean + std_err
+  #),
+  #alpha = 0.5
+  #) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")
+
+best_auc <- ridge_tune %>%
+  select_best("roc_auc", maximize = T)
+ridge_fit_train %>%
+  fit(data_train) %>%
+  pull_workflow_fit() %>%
+  vi(lambda = best_auc$penalty) %>%
+  mutate(
+    Importance = abs(Importance),
+    Variable = fct_reorder(Variable, Importance)
+  ) %>%
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL) +
+  ggtitle("Ridge Regression Model - Explanatory Variable Importance")
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+######################################################
+# ELNET PLOTS
+######################################################
+elnet_tune %>%  
+  collect_metrics() %>% 
+  ggplot(aes(penalty, mean, color = .metric)) +
+  #geom_errorbar(aes(
+  #  ymin = mean - std_err,
+   # ymax = mean + std_err
+  #),
+  #alpha = 0.5
+  #) +
+  geom_line(size = .5) +
+  facet_wrap(~.metric , scales = "free", nrow = 6) +
+  scale_x_log10() +
+  theme(legend.position = "none")
+
+best_auc <- elnet_tune %>%
+  select_best("roc_auc", maximize = T)
+elnet_fit_train %>%
+  fit(data_train) %>%
+  pull_workflow_fit() %>%
+  vi(lambda = best_auc$penalty, num_features =20) %>%
+  mutate(
+    Importance = abs(Importance),
+    Variable = fct_reorder(Variable, Importance)
+  ) %>%
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL) +
+  ggtitle("Elastic Net Model - Explanatory Variable Importance")
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+######################################################
+# STEPWISE PLOTS
+######################################################
+vi((step_fit_train$fit$fit$fit)) %>%
+    mutate(
+    Importance = abs(Importance),
+    Variable = fct_reorder(Variable, Importance)
+  ) %>%
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL) +
+  ggtitle("Stepwise Logisitc Regression - Explanatory Variable Importance")
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+######################################################
+# LR PLOTS
+######################################################
+vi((lr_fit_train$fit$fit$fit )) %>% 
+  mutate(
+    Importance = abs(Importance),
+    Variable = fct_reorder(Variable, Importance)
+  ) %>%
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL) +
+  ggtitle("Logistic Regression - Explanatory Variable Importance")
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+lasso_fit_train$fit$fit$spec
+ridge_fit_train$fit$fit$spec
+elnet_fit_train$fit$fit$spec
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+
+######################################################
+# GODNESS OF FIT
+######################################################
+train_x <- model.matrix(Gender ~ ., data_train)[, -1]
+train_y <- data_train$Gender
+
+test_x <- model.matrix(Gender ~ ., data_test)[, -1]
+test_y <- data_test$Gender
+
+lasso_mod <- (glmnet(test_x, test_y, family = "binomial", alpha = 1, lambda =0.024658110758226))
+ridge_mod <- (glmnet(test_x, test_y, family = "binomial", alpha = 0, lambda =0.0195639834351706))
+elnet_mod <- (glmnet(test_x, test_y, family = "binomial", alpha = 1, lambda =0.0242012826479438))
+
+lr_deviance <- lr_fit_train$fit$fit$fit$deviance
+#lr_fit_train$fit$fit$fit$aic%>% tidy()
+step_deviance <-step_fit_train$fit$fit$fit$deviance
+#step_fit_train$fit$fit$fit$aic%>% tidy()
+lasso_deviance <- deviance(lasso_mod)
+ridge_deviance <- deviance(ridge_mod)
+elnet_deviance <- deviance(elnet_mod)
+
+deviances <- cbind("Deviance", lr_deviance, step_deviance, ridge_deviance, lasso_deviance, elnet_deviance)
+
+
+#p-value = 1 - pchisq(deviance, degrees of freedom)
+summary(step_fit_train$fit$fit$fit)
+lr_fit_train$fit$fit$fit$df.residual
+step_fit_train$fit$fit$fit$df.residual
+lasso_mod$df
+ridge_mod$df
+elnet_mod$df
+
+p_lr_dev <- 1 - pchisq(lr_deviance, lr_fit_train$fit$fit$fit$df.residual)
+p_lr_dev
+p_step_dev <- 1 - pchisq(step_deviance, step_fit_train$fit$fit$fit$df.residual)
+p_step_dev
+p_ridge_dev <- 1- pchisq(ridge_deviance, ridge_mod$df)
+p_ridge_dev
+p_lasso_dev <- 1- pchisq(lasso_deviance, lasso_mod$df)
+p_lasso_dev
+p_elnet_dev <- 1- pchisq(elnet_deviance, elnet_mod$df)
+p_elnet_dev
+
+
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+lasso_coeff
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+
+#LASSO
+tLL <- -deviance(lasso_mod)
+k <- lasso_mod$df
+n <- lasso_mod$nobs
+AICc  <- -tLL+2*k+2*k*(k+1)/(n-k-1)
+AIC_ <- -tLL+2*k
+BIC<-log(n)*k - tLL
+
+h <- c("Model", "DF", "AIC", "BIC", "AICc", "Deviance")
+l <- c("Lasso",k, AIC_, BIC, AICc, lasso_deviance)
+#RIDGE
+tLL <- -deviance(ridge_mod)
+k <- ridge_mod$df
+n <- ridge_mod$nobs
+AICc  <- -tLL+2*k+2*k*(k+1)/(n-k-1)
+AIC_ <- -tLL+2*k
+BIC<-log(n)*k - tLL
+r <- c("Ridge",k, AIC_, BIC, AICc, ridge_deviance)
+#ELNET
+tLL <- -deviance(elnet_mod)
+k <- elnet_mod$df
+n <- elnet_mod$nobs
+AICc  <- -tLL+2*k+2*k*(k+1)/(n-k-1)
+AIC_ <- -tLL+2*k
+BIC<-log(n)*k - tLL
+e <- c("Elnet",k, AIC_, BIC, AICc, elnet_deviance)
+rbind(h,r,l, e)
+#LR
+
+AIC_<-lr_fit_train$fit$fit$fit$aic
+k <-lr_fit_train$fit$fit$fit$df.residual
+AICc <-AICc(lr_fit_train$fit$fit$fit)
+BIC <-BIC(lr_fit_train$fit$fit$fit)
+lr <- c("Logistic",k, AIC_, BIC, AICc, lr_deviance)
+#STEP
+
+AIC_<-step_fit_train$fit$fit$fit$aic
+k <-step_fit_train$fit$fit$fit$df.residual
+AICc <- AICc(step_fit_train$fit$fit$fit)
+BIC <-BIC(step_fit_train$fit$fit$fit)
+s <- c("Stepwise",k, AIC_, BIC, AICc, step_deviance)
+
+
+models <- data.frame(rbind(h,lr, s,r,l, e))
+
+names(models) <- models[1,]
+models <- models[-1,]
+rownames(models) <- NULL
+models <- models %>% 
+  mutate_at("AIC", as.numeric) %>% 
+  mutate_at("AICc", as.numeric)%>% 
+  mutate_at("BIC", as.numeric)%>% 
+  mutate_at("Deviance", as.numeric) %>% mutate_if(is.numeric, round,digits=2)
+models %>%
+  kbl(caption = "Table x. )") %>%
+  kable_classic(full_width = F, html_font = "Cambria") %>%
+  collapse_rows(columns = 1, valign = "top")
+save(models, file = "model_compare.RData")
+
+
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+hist(elnet_pred_prob_train$.pred_Female)
+hist(elnet_pred_prob_train$.pred_Male)
+
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+summary(lasso_mod$dev.ratio)
+ridge_mod$dev.ratio
+elnet_mod$dev.ratio
+plot(residuals(step_fit_train$fit$fit$fit))
+plot(residuals(lr_fit_train$fit$fit$fit))
+#plot(residuals(lasso_fit_train$fit$fit$fit$nobs))
+
+
+## ---- fig.width = 4 ,fig.height = 4-----------------------------------------------------------------------------------------------
+
+
+plot(lasso_fit_train$fit$fit$fit)
+plot_glmnet(elnet_fit_train$fit$fit$fit ,
+xvar = c("rlambda", "lambda", "norm", "dev"),
+label = 10, nresponse = NA, grid.col = NA, s = NA)
+moo <-glmnet(train_x, train_y, family = "binomial", alpha = 1, lambda =0.024658110758226)
+plotres(moo,w1.col=1:9, w1.nresponse="Male", w1.xvar = c( "dev"))
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+
+elnet_mod <- (glmnet::glmnet(test_x, test_y, family = "binomial", alpha = 1, lambda =0.0242012826479438, type.measure = "deviance"))
+
+
+elnet_mod$nulldev
+
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+library (sure)
+
+resid(elnet_pred_class_test)
+elnet_fit_rs$.predictions
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+
+t1 <-lr_fit_train$fit$fit$fit %>% tidy() 
+t2 <- step_fit_train$fit$fit$fit  %>% tidy()
+t3 <- ridge_mod  %>% tidy() %>% dplyr::select(term, estimate)
+t4 <- lasso_mod  %>% tidy() %>% dplyr::select(term, estimate)
+t5 <- elnet_mod  %>% tidy() %>% dplyr::select(term, estimate)
+t6 <- results_table_test
+t6 <-t6[-(2:6),]
+rownames(t6) <- NULL
+save(t1, file = "table1.RData")
+save(t2, file = "table2.RData")
+save(ridge_coeff, file = "table3.RData")
+save(lasso_coeff, file = "table4.RData")
+save(elnet_coeff, file = "table5.RData")
+save(t6, file = "table6.RData")
+
+
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+
+lambda_plot <- glmnet::cv.glmnet(train_x, train_y, family = "binomial", alpha =1, type.measure = "auc", nfolds=9, nlamda=100000)
+autoplot(lambda_plot, colour = 'red')
+plot(lambda_plot)
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+######################################################
+# Multicollinearity test
+######################################################
+
+vif_table <-vif(lr_fit_train$fit$fit$fit) %>%
+  tidy() %>% 
+  rename(VIF = x) %>% 
+  rename(Variable=names)
+
+save(vif_table, file = "table_appendix1.RData")
+vif(step_fit_train$fit$fit$fit) %>%
+  tidy() %>% 
+  rename(VIF = x) %>% 
+  rename(Variable=names)
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+
+######################################################
+# Linearity test
+######################################################
+crPlots(glm(Gender ~ (Age), 
+  data=final_data, family=binomial), smooth=list(span=1))
+crPlots(glm(Gender ~ BMI, 
+  data=final_data, family=binomial), smooth=list(span=1))
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+
+cnf_test <- confusion.glmnet(elnet_mod, newx = test_x, newy = test_y)
+cnf_test
+cnf_test %>% tidy() %>%
+plot_confusion_matrix( 
+                      target_col = "True", 
+                      prediction_col = "Predicted",
+                      counts_col = "n")
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+
+cnfmat_lr <- read_excel(here("data","conf_mat_lr.xlsx"))
+cnfmat_step <- read_excel(here("data","conf_mat_lstep.xlsx"))
+
+lr_results_test
+confusion_matrix(lr_results_test$Gender, lr_results_test$.pred_class)
+cmat <- conf_mat(lr_results_test, truth = "Gender", estimate = ".pred_class")
+cnf_test %>% tidy()
+cnfmat_lr %>% plot_confusion_matrix( 
+                      target_col = "True", 
+                      prediction_col = "Predicted",
+                      counts_col = "n")
+
+cnfmat_step %>% plot_confusion_matrix( 
+                      target_col = "True", 
+                      prediction_col = "Predicted",
+                      counts_col = "n")
+
+
+
+
+## ---- fig.width =6 ,fig.height = 6------------------------------------------------------------------------------------------------
+
+autoplot(glm(formula = Gender~ ., family = "binomial", data = data_train), which = 1:6, label.size = 3)
+
+
+## ---------------------------------------------------------------------------------------------------------------------------------
+
+
+gvif_ <- gvif(glm(formula = Gender~ ., family = "binomial", data = data_train))
+t10 <- (gvif_)
+save(t10, file = "gvif.RData")
+car::vif(glm(formula = Gender~ ., family = "binomial", data = data_train))
+
